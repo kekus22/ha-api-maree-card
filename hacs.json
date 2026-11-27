@@ -1,0 +1,7 @@
+{
+  "name": "API Marée Card",
+  "filename": "api-maree-card.js",
+  "homeassistant": "2025.8.0",
+  "render_readme": true,
+  "country": ["FR"]
+}
