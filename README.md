@@ -13,6 +13,19 @@ Carte Lovelace pour l'intégration Home Assistant
   sections.
 - Aucune dépendance externe, aucun appel réseau : la carte lit uniquement les attributs de l'entité.
 
+### Estuaire de la Rance (source EDF)
+
+Avec l'entité *Hauteur d'eau* de la source **Estuaire de la Rance (EDF)**, la carte affiche en plus :
+
+- la **courbe de la mer** en pointillé, à comparer au niveau de l'estuaire ;
+- le **bandeau de l'écluse** sous la courbe (sas, sas à la demande, sas incertain, pas de sas) et le
+  statut actuel dans l'en-tête ;
+- les **paliers** des niveaux hauts et bas (par exemple « 10:25–11:30 · 12,3 m »).
+
+![Aperçu Rance : mode complet (clair), journée (sombre), mobile](docs/apercu-rance.png)
+
+Options propres à cette source : `show_sea` et `show_locks` (activées par défaut).
+
 ## Prérequis
 
 L'intégration [API Marée](https://github.com/kekus22/ha-api-maree) installée et configurée.
@@ -57,6 +70,8 @@ title: Saint-Malo   # facultatif
 | `days` | `7` | nombre de jours du tableau (1 à 7) |
 | `show_sun` | `true` | assombrit les heures de nuit |
 | `show_attribution` | `true` | affiche la mention de la source |
+| `show_sea` | `true` | Rance : courbe du niveau de la mer |
+| `show_locks` | `true` | Rance : horaires de l'écluse |
 | `title` | nom du port | titre de la carte |
 
 ### Couleurs
