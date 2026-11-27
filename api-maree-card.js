@@ -4,7 +4,7 @@
  * Licence MIT.
  */
 
-const CARD_VERSION = "0.1.0";
+const CARD_VERSION = "0.2.0";
 const CARD_TYPE = "api-maree-card";
 
 const I18N = {
@@ -24,6 +24,21 @@ const I18N = {
     today: "Aujourd'hui",
     tomorrow: "Demain",
     warning: "Coefficients non officiels — ne pas utiliser pour la navigation.",
+    warning_edf: "Prévisions EDF à ± 30 cm (hors surcote et décote) — ne pas utiliser pour la navigation.",
+    edf_high: "Niveau haut",
+    edf_low: "Niveau bas",
+    edf_next_high: "Prochain haut",
+    edf_next_low: "Prochain bas",
+    edf_high_short: "Haut",
+    edf_low_short: "Bas",
+    estuary: "Estuaire",
+    sea: "Mer",
+    lock: "Écluse",
+    lock_sas: "Sas",
+    lock_on_demand: "Sas à la demande",
+    lock_uncertain: "Sas incertain",
+    lock_no_sas: "Pas de sas",
+    lock_unknown: "Inconnu",
     editor: {
       entity: "Entité « Hauteur d'eau » (intégration API Marée)",
       title: "Titre (facultatif)",
@@ -37,6 +52,8 @@ const I18N = {
       days: "Nombre de jours du tableau",
       show_sun: "Afficher le jour et la nuit",
       show_attribution: "Afficher la source des données",
+      show_sea: "Rance : afficher le niveau de la mer",
+      show_locks: "Rance : afficher les horaires de l'écluse",
     },
   },
   en: {
@@ -55,6 +72,21 @@ const I18N = {
     today: "Today",
     tomorrow: "Tomorrow",
     warning: "Unofficial coefficients — not for navigation.",
+    warning_edf: "EDF forecasts, ± 30 cm (excluding storm surge) — not for navigation.",
+    edf_high: "High level",
+    edf_low: "Low level",
+    edf_next_high: "Next high",
+    edf_next_low: "Next low",
+    edf_high_short: "High",
+    edf_low_short: "Low",
+    estuary: "Estuary",
+    sea: "Sea",
+    lock: "Lock",
+    lock_sas: "Lock open",
+    lock_on_demand: "On demand",
+    lock_uncertain: "Uncertain",
+    lock_no_sas: "Closed",
+    lock_unknown: "Unknown",
     editor: {
       entity: "“Water level” entity (API Marée integration)",
       title: "Title (optional)",
@@ -68,6 +100,8 @@ const I18N = {
       days: "Number of days in the table",
       show_sun: "Show day and night",
       show_attribution: "Show data source",
+      show_sea: "Rance: show sea level",
+      show_locks: "Rance: show lock schedule",
     },
   },
 };
@@ -79,7 +113,11 @@ const DEFAULTS = {
   days: 7,
   show_sun: true,
   show_attribution: true,
+  show_sea: true,
+  show_locks: true,
 };
+
+const LOCK_STATUSES = ["sas", "on_demand", "uncertain", "no_sas", "unknown"];
 
 function lang(hass) {
   const l = (hass && (hass.locale?.language || hass.language)) || "fr";
@@ -175,7 +213,14 @@ function localMidnight(hass, date) {
 function parseData(attrs) {
   if (!attrs || !Array.isArray(attrs.extrema)) return null;
   const extrema = attrs.extrema
-    .map((e) => ({ type: e.type, time: new Date(e.time), height: e.height, coef: e.coef }))
+    .map((e) => ({
+      type: e.type,
+      time: new Date(e.time),
+      height: e.height,
+      coef: e.coef,
+      start: e.start ? new Date(e.start) : null,
+      end: e.end ? new Date(e.end) : null,
+    }))
     .sort((a, b) => a.time - b.time);
   const curveStart = attrs.curve_start ? new Date(attrs.curve_start).getTime() : null;
   const stepMs = (attrs.curve_step || 10) * 60000;
@@ -185,19 +230,45 @@ function parseData(attrs) {
     sunrise: s.sunrise ? new Date(s.sunrise) : null,
     sunset: s.sunset ? new Date(s.sunset) : null,
   }));
-  return { extrema, curveStart, stepMs, curve, sun, attribution: attrs.data_attribution, site: attrs.site_name };
+  const sea = Array.isArray(attrs.sea_curve) ? attrs.sea_curve : [];
+  const locks = (attrs.locks || [])
+    .map((l) => ({ start: new Date(l.start).getTime(), end: new Date(l.end).getTime(), status: l.status }))
+    .filter((l) => l.end > l.start);
+  return {
+    extrema,
+    curveStart,
+    stepMs,
+    curve,
+    sea,
+    locks,
+    sun,
+    source: attrs.source || "api_maree",
+    attribution: attrs.data_attribution,
+    site: attrs.site_name,
+  };
+}
+
+function seriesAt(series, curveStart, stepMs, ts) {
+  if (curveStart === null || series.length < 2) return null;
+  const offset = (ts - curveStart) / stepMs;
+  if (offset < 0 || offset > series.length - 1) return null;
+  const i = Math.floor(offset);
+  if (i >= series.length - 1) return series[series.length - 1];
+  return series[i] + (series[i + 1] - series[i]) * (offset - i);
+}
+
+function seaAt(data, ts) {
+  return seriesAt(data.sea, data.curveStart, data.stepMs, ts);
+}
+
+function lockAt(data, ts) {
+  return data.locks.find((l) => l.start <= ts && ts < l.end) || null;
 }
 
 function heightAt(data, ts) {
-  const { curve, curveStart, stepMs, extrema } = data;
-  if (curveStart !== null && curve.length >= 2) {
-    const offset = (ts - curveStart) / stepMs;
-    if (offset >= 0 && offset <= curve.length - 1) {
-      const i = Math.floor(offset);
-      if (i >= curve.length - 1) return curve[curve.length - 1];
-      return curve[i] + (curve[i + 1] - curve[i]) * (offset - i);
-    }
-  }
+  const { extrema } = data;
+  const fine = seriesAt(data.curve, data.curveStart, data.stepMs, ts);
+  if (fine !== null) return fine;
   // Repli : interpolation sinusoïdale entre les extrema encadrants.
   let prev = null;
   let next = null;
@@ -335,6 +406,9 @@ class ApiMareeCard extends HTMLElement {
     const rising = next ? next.type === "high" : null;
     const height = heightAt(data, now);
     const title = this._config.title || data.site || st.attributes.friendly_name;
+    const edf = data.source === "edf_rance";
+    this._edf = edf;
+    const lock = edf && this._config.show_locks ? lockAt(data, now) : null;
 
     this.shadowRoot.innerHTML = `
       <style>${STYLES}</style>
@@ -342,6 +416,7 @@ class ApiMareeCard extends HTMLElement {
         <div class="header">
           <div class="title">${esc(title)}</div>
           ${nextHigh?.coef != null ? `<span class="coef ${coefClass(nextHigh.coef)}" title="${esc(t(hass, "coef"))}">${nextHigh.coef}</span>` : ""}
+          ${lock ? `<span class="lock-chip lk-${esc(lock.status)}" title="${esc(t(hass, "lock"))}">${esc(t(hass, "lock"))} · ${esc(t(hass, `lock_${lock.status}`))} <small>→ ${esc(fmtTime(hass, new Date(lock.end)))}</small></span>` : ""}
         </div>
         <div class="summary">
           <div class="now">
@@ -349,13 +424,14 @@ class ApiMareeCard extends HTMLElement {
             ${rising != null ? `<span class="trend ${rising ? "up" : "down"}">${rising ? "▲" : "▼"} ${esc(t(hass, rising ? "rising" : "falling"))}</span>` : ""}
           </div>
           <div class="nexts">
-            ${this._nextBlock(nextHigh, "next_high")}
-            ${this._nextBlock(nextLow, "next_low")}
+            ${this._nextBlock(nextHigh, edf ? "edf_next_high" : "next_high")}
+            ${this._nextBlock(nextLow, edf ? "edf_next_low" : "next_low")}
           </div>
         </div>
         ${this._chart(data, now)}
+        ${edf ? this._legend(data) : ""}
         ${this._config.mode === "full" ? this._table(data, now) : ""}
-        ${this._config.show_attribution ? `<div class="attribution">${safeAttribution(data.attribution) || "Données : api-maree.fr (CC BY 4.0)"}<br>${esc(t(hass, "warning"))}</div>` : ""}
+        ${this._config.show_attribution ? `<div class="attribution">${safeAttribution(data.attribution) || "Données : api-maree.fr (CC BY 4.0)"}<br>${esc(t(hass, edf ? "warning_edf" : "warning"))}</div>` : ""}
       </ha-card>`;
     this._bindTooltip(data);
   }
@@ -369,7 +445,7 @@ class ApiMareeCard extends HTMLElement {
     const hass = this._hass;
     return `<div class="next ${ext.type}">
       <span class="label">${esc(t(hass, labelKey))}</span>
-      <span class="value">${esc(fmtTime(hass, ext.time))}</span>
+      <span class="value">${esc(ext.start && ext.end ? `${fmtTime(hass, ext.start)}–${fmtTime(hass, ext.end)}` : fmtTime(hass, ext.time))}</span>
       <span class="sub">${fmtNum(hass, ext.height, 2)} m</span>
     </div>`;
   }
@@ -389,17 +465,27 @@ class ApiMareeCard extends HTMLElement {
     const [start, end] = this._window(now);
     const W = Math.max(280, Math.round(this._width || 600));
     const H = 190;
-    const pad = { l: 30, r: 10, t: 26, b: 22 };
+    const showSea = this._edf && this._config.show_sea && data.sea.length > 1;
+    const showLocks = this._edf && this._config.show_locks && data.locks.length > 0;
+    const pad = { l: 30, r: 10, t: 26, b: showLocks ? 36 : 22 };
     const step = 10 * 60000;
     const points = [];
+    const seaPoints = [];
     for (let ts = start; ts <= end; ts += step) {
       const h = heightAt(data, ts);
       if (h != null) points.push([ts, h]);
+      if (showSea) {
+        const sh = seaAt(data, ts);
+        if (sh != null) seaPoints.push([ts, sh]);
+      }
     }
     if (points.length < 2) return "";
 
     const inWindow = data.extrema.filter((e) => e.time >= start && e.time <= end);
-    const heights = points.map((p) => p[1]).concat(inWindow.map((e) => e.height));
+    const heights = points
+      .map((p) => p[1])
+      .concat(seaPoints.map((p) => p[1]))
+      .concat(inWindow.map((e) => e.height));
     let minH = Math.floor(Math.min(...heights));
     let maxH = Math.ceil(Math.max(...heights));
     if (maxH - minH < 1) maxH = minH + 1;
@@ -410,6 +496,19 @@ class ApiMareeCard extends HTMLElement {
 
     const line = points.map(([ts, h], i) => `${i ? "L" : "M"}${x(ts).toFixed(1)},${y(h).toFixed(1)}`).join("");
     const area = `${line}L${x(points[points.length - 1][0]).toFixed(1)},${H - pad.b}L${x(points[0][0]).toFixed(1)},${H - pad.b}Z`;
+    const seaLine = seaPoints.length > 1
+      ? `<path class="sea-line" d="${seaPoints.map(([ts, h], i) => `${i ? "L" : "M"}${x(ts).toFixed(1)},${y(h).toFixed(1)}`).join("")}"/>`
+      : "";
+
+    // Écluse (bandeau sous la courbe)
+    let lockBand = "";
+    if (showLocks) {
+      lockBand = data.locks
+        .map((l) => [Math.max(l.start, start), Math.min(l.end, end), l.status])
+        .filter(([a, b]) => b > a)
+        .map(([a, b, st]) => `<rect class="lock lk-${LOCK_STATUSES.includes(st) ? st : "unknown"}" x="${x(a).toFixed(1)}" y="${H - pad.b + 3}" width="${Math.max(0.5, x(b) - x(a)).toFixed(1)}" height="8"><title>${esc(t(hass, `lock_${st}`))}</title></rect>`)
+        .join("");
+    }
 
     // Nuit
     let night = "";
@@ -447,7 +546,7 @@ class ApiMareeCard extends HTMLElement {
     for (let ts = firstTick; ts <= end; ts += 3600000) {
       const hourNum = parseInt(fmtHour(hass, new Date(ts)), 10);
       if (hourNum % tickH !== 0) continue;
-      ticks += `<line class="tick" x1="${x(ts).toFixed(1)}" x2="${x(ts).toFixed(1)}" y1="${H - pad.b}" y2="${H - pad.b + 4}"/>
+      ticks += `<line class="tick" x1="${x(ts).toFixed(1)}" x2="${x(ts).toFixed(1)}" y1="${H - pad.b}" y2="${H - pad.b + (showLocks ? 14 : 4)}"/>
         <text class="axis" x="${x(ts).toFixed(1)}" y="${H - 6}" text-anchor="middle">${fmtHour(hass, new Date(ts))}</text>`;
     }
 
@@ -458,7 +557,8 @@ class ApiMareeCard extends HTMLElement {
         const ey = y(e.height);
         const ty = ey - 8;
         const anchor = ex < pad.l + 30 ? "start" : ex > W - pad.r - 30 ? "end" : "middle";
-        const label = `${fmtTime(hass, e.time)} · ${fmtNum(hass, e.height, 1)} m${e.coef != null ? ` · ${e.coef}` : ""}`;
+        const when = e.start && e.end ? `${fmtTime(hass, e.start)}–${fmtTime(hass, e.end)}` : fmtTime(hass, e.time);
+        const label = `${when} · ${fmtNum(hass, e.height, 1)} m${e.coef != null ? ` · ${e.coef}` : ""}`;
         return `<circle class="ext ${e.type}" cx="${ex.toFixed(1)}" cy="${ey.toFixed(1)}" r="3.5"/>
           <text class="ext-label" x="${ex.toFixed(1)}" y="${Math.max(10, Math.min(H - pad.b - 2, ty)).toFixed(1)}" text-anchor="${anchor}">${esc(label)}</text>`;
       })
@@ -482,8 +582,9 @@ class ApiMareeCard extends HTMLElement {
         </defs>
         ${night}${grid}
         <path class="area" d="${area}" fill="url(#water)"/>
+        ${seaLine}
         <path class="line" d="${line}"/>
-        ${ticks}${nowMark}${marks}
+        ${lockBand}${ticks}${nowMark}${marks}
         <line class="cursor" x1="0" x2="0" y1="${pad.t - 4}" y2="${H - pad.b}" visibility="hidden"/>
         <rect class="hit" x="${pad.l}" y="0" width="${W - pad.l - pad.r}" height="${H}"/>
       </svg>
@@ -508,7 +609,14 @@ class ApiMareeCard extends HTMLElement {
       cursor.setAttribute("x2", px.toFixed(1));
       cursor.setAttribute("visibility", "visible");
       tip.hidden = false;
-      tip.textContent = `${fmtTime(this._hass, new Date(ts))} · ${fmtNum(this._hass, h, 2)} m`;
+      const parts = [`${fmtTime(this._hass, new Date(ts))} · ${fmtNum(this._hass, h, 2)} m`];
+      if (this._edf) {
+        const sh = seaAt(data, ts);
+        if (sh != null && this._config.show_sea) parts.push(`${t(this._hass, "sea")} ${fmtNum(this._hass, sh, 2)} m`);
+        const lk = this._config.show_locks ? lockAt(data, ts) : null;
+        if (lk) parts.push(`${t(this._hass, "lock")} : ${t(this._hass, `lock_${lk.status}`)}`);
+      }
+      tip.textContent = parts.join(" · ");
       const left = Math.min(Math.max(ev.clientX - rect.left, 40), rect.width - 40);
       tip.style.left = `${left}px`;
     };
@@ -519,6 +627,21 @@ class ApiMareeCard extends HTMLElement {
     svg.addEventListener("pointermove", move);
     svg.addEventListener("pointerdown", move);
     svg.addEventListener("pointerleave", leave);
+  }
+
+  _legend(data) {
+    const hass = this._hass;
+    const items = [`<span class="lg"><i class="lg-line"></i>${esc(t(hass, "estuary"))}</span>`];
+    if (this._config.show_sea && data.sea.length > 1) {
+      items.push(`<span class="lg"><i class="lg-line sea"></i>${esc(t(hass, "sea"))}</span>`);
+    }
+    if (this._config.show_locks && data.locks.length) {
+      const present = new Set(data.locks.map((l) => l.status));
+      for (const st of LOCK_STATUSES) {
+        if (present.has(st)) items.push(`<span class="lg"><i class="lg-box lk-${st}"></i>${esc(t(hass, `lock_${st}`))}</span>`);
+      }
+    }
+    return `<div class="legend">${items.join("")}</div>`;
   }
 
   _table(data, now) {
@@ -541,14 +664,14 @@ class ApiMareeCard extends HTMLElement {
         const cells = list
           .map(
             (e) => `<span class="tide ${e.type} ${e.time.getTime() < now ? "past" : ""}">
-              <b>${esc(t(hass, e.type === "high" ? "high_short" : "low_short"))}</b> ${esc(fmtTime(hass, e.time))}
+              <b>${esc(t(hass, `${this._edf ? "edf_" : ""}${e.type === "high" ? "high_short" : "low_short"}`))}</b> ${esc(e.start && e.end ? `${fmtTime(hass, e.start)}–${fmtTime(hass, e.end)}` : fmtTime(hass, e.time))}
               <small>${fmtNum(hass, e.height, 1)} m</small></span>`
           )
           .join("");
         return `<div class="row"><div class="day">${esc(label)}</div><div class="tides">${cells}</div><div class="coefs">${coefs}</div></div>`;
       })
       .join("");
-    return `<div class="table">${rows}</div>`;
+    return `<div class="table${this._edf ? " edf" : ""}">${rows}</div>`;
   }
 }
 
@@ -586,6 +709,21 @@ const STYLES = `
   .next.low .value { color: var(--_low); }
   .next .sub { font-size: 0.8em; color: var(--secondary-text-color); }
   .chart { position: relative; margin: 4px -4px 0; }
+  .sea-line { fill: none; stroke: var(--secondary-text-color); stroke-width: 1.5; stroke-dasharray: 5 4; opacity: 0.8; vector-effect: non-scaling-stroke; }
+  .lk-sas { fill: #c4d600; background: #c4d600; }
+  .lk-on_demand { fill: #2e9e14; background: #2e9e14; }
+  .lk-uncertain { fill: #ffb210; background: #ffb210; }
+  .lk-no_sas { fill: #fe5716; background: #fe5716; }
+  .lk-unknown { fill: var(--disabled-text-color, #bdbdbd); background: var(--disabled-text-color, #bdbdbd); }
+  .lock-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 10px; border-radius: 12px;
+    font-size: 0.85em; font-weight: 600; color: #1b1b1b; white-space: nowrap; }
+  .lock-chip.lk-on_demand, .lock-chip.lk-no_sas { color: #fff; }
+  .lock-chip small { font-weight: 400; opacity: 0.85; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 2px; font-size: 0.75em; color: var(--secondary-text-color); }
+  .lg { display: inline-flex; align-items: center; gap: 5px; }
+  .lg-line { display: inline-block; width: 16px; border-top: 2px solid var(--_water); }
+  .lg-line.sea { border-top: 2px dashed var(--secondary-text-color); }
+  .lg-box { display: inline-block; width: 12px; height: 8px; border-radius: 2px; }
   svg { width: 100%; height: auto; display: block; touch-action: pan-y; }
   .night { fill: var(--primary-text-color); opacity: 0.06; }
   .grid { stroke: var(--divider-color, rgba(127,127,127,.2)); stroke-width: 1; vector-effect: non-scaling-stroke; }
@@ -618,6 +756,7 @@ const STYLES = `
   .attribution { margin-top: 10px; font-size: 0.7em; line-height: 1.35; color: var(--secondary-text-color); }
   .attribution a { color: inherit; }
   .tides { display: grid; grid-template-columns: repeat(4, max-content); }
+  .table.edf .tides { grid-template-columns: repeat(2, max-content); }
   @container (max-width: 520px) {
     .tides { grid-template-columns: repeat(2, max-content); }
   }
@@ -682,7 +821,17 @@ class ApiMareeCardEditor extends HTMLElement {
         : []),
       { name: "show_sun", selector: { boolean: {} } },
       { name: "show_attribution", selector: { boolean: {} } },
+      ...(this._isEdf()
+        ? [
+            { name: "show_sea", selector: { boolean: {} } },
+            { name: "show_locks", selector: { boolean: {} } },
+          ]
+        : []),
     ];
+  }
+
+  _isEdf() {
+    return this._hass?.states?.[this._config?.entity]?.attributes?.source === "edf_rance";
   }
 
   _render() {
